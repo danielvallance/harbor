@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — Unikraft Cloud environment
+
+`--env unikraft` runs a task in a Unikraft Cloud microVM. Harbor builds the
+task image from its Dockerfile with the `unikraft` CLI, tags it with the
+environment's content hash so unchanged tasks skip the build, and starts it
+with the sandbox plugin attached; commands and files travel over the
+instance's authenticated plugin route, and command output streams to the
+trial as it arrives. A task whose network policy is not public gets its own
+network shield, a relay microVM that denies every host the allowlist does not
+name; the shield's policies are replaced at run time, so agent and verifier
+phases can carry different policies. Requires `UKC_TOKEN`, `UKC_USER` and the
+`unikraft` CLI; install with `harbor[unikraft]`.
+
 ## Unreleased — Modal domain filtering after restricted setup
 
 Modal sandboxes that start offline or with only IP/CIDR allowances can now

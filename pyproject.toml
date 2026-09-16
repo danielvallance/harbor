@@ -60,6 +60,7 @@ override-dependencies = ["websockets>=15"]
 [tool.uv.sources]
 harbor-rewardkit = { workspace = true }
 harbor-langsmith = { workspace = true }
+unikraft-cloud = { path = "../python-sdk", editable = true }
 
 [project.optional-dependencies]
 # google-antigravity bundles a platform-specific localharness binary; PyPI
@@ -86,6 +87,9 @@ opensandbox = ["opensandbox>=0.1.7"]
 beam = ["beam-client>=0.2.197"]
 archil = ["archil>=0.12.0"]
 thunder = ["thunder-sandbox>=0.7.1"]
+# The sandbox plugin client ships in unikraft-cloud 0.2.0; until that release
+# is on PyPI the source below points at a local checkout of the SDK.
+unikraft = ["unikraft-cloud>=0.1.0"]
 # The Sandbox SDK is private early access; keep this extra opt-in rather than
 # including it in cloud/all until the SDK is generally available.
 skypilot = ["skypilot-nightly>=0.10.0"]
@@ -122,6 +126,7 @@ dev = [
     "harbor[computer-1]",
     "harbor[dspy]",
     "harbor[adapter]",
+    "harbor[unikraft]",
     "harbor-rewardkit[all]",
     "harbor-langsmith",
     "ipykernel>=6.30.1",

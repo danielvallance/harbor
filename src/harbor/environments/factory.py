@@ -161,6 +161,11 @@ _ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
         "ThunderEnvironment",
         "thunder",
     ),
+    EnvironmentType.UNIKRAFT: _EnvEntry(
+        "harbor.environments.unikraft",
+        "UnikraftEnvironment",
+        "unikraft",
+    ),
 }
 
 
