@@ -6,6 +6,9 @@ import base64
 import io
 import json
 import logging
+import shlex
+import shutil
+import subprocess
 import tarfile
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path, PurePosixPath
@@ -30,6 +33,7 @@ from harbor.environments.unikraft import (
     UnikraftEnvironment,
     _image_repository,
     _run_as_user,
+    _run_in_shell,
     _ShieldApi,
     parse_dockerfile_env,
     parse_dockerfile_user,
@@ -38,6 +42,14 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ResourceMode
 from harbor.models.trial.paths import TrialPaths
+
+SELECT_SHELL = "_shell=$(command -v bash || echo /bin/sh)"
+
+
+def inner_command(cmd: str) -> str:
+    """The command the guest shell wrapper runs."""
+    return shlex.split(cmd)[-1]
+
 
 Answer = tuple[int, bytes, bytes]
 
@@ -936,22 +948,27 @@ async def test_exec_runs_as_the_requested_user(
     env, sandbox = await _started(fake_ukc, temp_dir)
 
     await env.exec("echo hi")
-    assert sandbox.execs[-1]["cmd"] == "echo hi"
+    assert sandbox.execs[-1]["cmd"] == f"{SELECT_SHELL}; exec \"$_shell\" -c 'echo hi'"
 
     await env.exec("echo hi", user="agent")
-    assert sandbox.execs[-1]["cmd"] == "su agent -s /bin/sh -c 'echo hi'"
+    assert sandbox.execs[-1]["cmd"] == (
+        f"{SELECT_SHELL}; exec su agent -s \"$_shell\" -c 'echo hi'"
+    )
 
     await env.exec("echo hi", user=1000)
     assert sandbox.execs[-1]["cmd"] == (
-        "su \"$(getent passwd 1000 | cut -d: -f1)\" -s /bin/sh -c 'echo hi'"
+        f'{SELECT_SHELL}; exec su "$(getent passwd 1000 | cut -d: -f1)" '
+        "-s \"$_shell\" -c 'echo hi'"
     )
 
     with env.with_default_user("dev"):
         await env.exec("echo hi")
-    assert sandbox.execs[-1]["cmd"] == "su dev -s /bin/sh -c 'echo hi'"
+    assert sandbox.execs[-1]["cmd"] == (
+        f"{SELECT_SHELL}; exec su dev -s \"$_shell\" -c 'echo hi'"
+    )
 
     await env.exec("echo hi", user="root")
-    assert sandbox.execs[-1]["cmd"] == "echo hi"
+    assert sandbox.execs[-1]["cmd"] == f"{SELECT_SHELL}; exec \"$_shell\" -c 'echo hi'"
 
 
 async def test_dockerfile_user_is_the_default_user(
@@ -961,10 +978,12 @@ async def test_dockerfile_user_is_the_default_user(
         fake_ukc, temp_dir, dockerfile_contents="FROM ubuntu:24.04\nUSER agent:agent\n"
     )
     await env.exec("id")
-    assert sandbox.execs[-1]["cmd"] == "su agent -s /bin/sh -c id"
+    assert sandbox.execs[-1]["cmd"] == (
+        f'{SELECT_SHELL}; exec su agent -s "$_shell" -c id'
+    )
 
     await env.exec("id", user="root")
-    assert sandbox.execs[-1]["cmd"] == "id"
+    assert sandbox.execs[-1]["cmd"] == f'{SELECT_SHELL}; exec "$_shell" -c id'
 
 
 async def test_exec_reports_a_nonzero_exit_without_raising(
@@ -1029,7 +1048,9 @@ async def test_exec_streams_output_to_the_callback(
     assert result.stdout == "hello é\n"
     assert result.stderr == "warn\n"
     assert result.return_code == 0
-    assert sandbox.execs[-1]["cmd"] == "su agent -s /bin/sh -c make"
+    assert sandbox.execs[-1]["cmd"] == (
+        f'{SELECT_SHELL}; exec su agent -s "$_shell" -c make'
+    )
     assert sandbox.commands["cmd-1"].deleted is True
 
 
@@ -1207,7 +1228,7 @@ async def test_upload_dir_transfers_a_tar_archive(
 
     await env.upload_dir(source, "/tests")
 
-    unpack, remove = [call["cmd"] for call in sandbox.execs]
+    unpack, remove = [inner_command(call["cmd"]) for call in sandbox.execs]
     (archive,) = sandbox.fs.files
     assert archive.startswith("/tmp/.hb-transfer-") and archive.endswith(".tar.gz")
     assert unpack == f"mkdir -p /tests && tar -xzf {archive} -C /tests"
@@ -1232,7 +1253,7 @@ async def test_upload_dir_reports_a_failed_unpack(
     )
     with pytest.raises(RuntimeError, match="truncated"):
         await env.upload_dir(source, "/src")
-    assert sandbox.execs[-1]["cmd"].startswith("rm -f ")
+    assert inner_command(sandbox.execs[-1]["cmd"]).startswith("rm -f ")
 
 
 async def test_download_file_writes_bytes(
@@ -1256,6 +1277,7 @@ async def test_download_dir_packs_remotely_and_extracts_locally(
     (remote / "b.sh").chmod(0o755)
 
     def pack(cmd: str) -> tuple[int, bytes, bytes]:
+        cmd = inner_command(cmd)
         if cmd.startswith("tar -czf "):
             archive = cmd.split()[2]
             sandbox.fs.files[archive] = pack_dir_to_bytes(
@@ -1269,7 +1291,7 @@ async def test_download_dir_packs_remotely_and_extracts_locally(
 
     assert (target / "sub" / "a.txt").read_text() == "A"
     assert (target / "b.sh").stat().st_mode & 0o111
-    pack_cmd, remove_cmd = [call["cmd"] for call in sandbox.execs]
+    pack_cmd, remove_cmd = [inner_command(call["cmd"]) for call in sandbox.execs]
     assert pack_cmd.endswith("-C /logs/agent .")
     assert remove_cmd.startswith("rm -f /tmp/.hb-transfer-")
 
@@ -1449,12 +1471,36 @@ def test_parse_dockerfile_user_takes_the_last_stage(tmp_path: Path) -> None:
 
 def test_run_as_user_quotes_the_command() -> None:
     assert _run_as_user("echo 'it works'", "agent") == (
-        "su agent -s /bin/sh -c 'echo '\"'\"'it works'\"'\"''"
+        f"{SELECT_SHELL}; exec su agent -s \"$_shell\" -c 'echo '\"'\"'it works'\"'\"''"
     )
-    assert (
-        _run_as_user("id", "1000")
-        == 'su "$(getent passwd 1000 | cut -d: -f1)" -s /bin/sh -c id'
+    assert _run_as_user("id", "1000") == (
+        f'{SELECT_SHELL}; exec su "$(getent passwd 1000 | cut -d: -f1)" '
+        '-s "$_shell" -c id'
     )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="the host has no bash")
+def test_run_in_shell_runs_bash_syntax() -> None:
+    # Harbor prefixes agent commands with `set -o pipefail`, which a POSIX
+    # shell such as dash rejects.
+    result = subprocess.run(
+        ["/bin/sh", "-c", _run_in_shell("set -o pipefail; echo ok")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_run_in_shell_falls_back_to_sh(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["/bin/sh", "-c", _run_in_shell("echo ok")],
+        capture_output=True,
+        text=True,
+        env={"PATH": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 def test_image_repository_drops_scheme_registry_digest_and_tag() -> None:

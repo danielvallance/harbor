@@ -181,13 +181,23 @@ def _kernel_stop_detail(stop_code: int) -> str:
     return f"the kernel exited on {described}" + (f" (errno {errno})" if errno else "")
 
 
+#: Shell selection the guest evaluates before it runs a command. Harbor
+#: commands use bash syntax, and an image without bash still gets ``sh``.
+_SELECT_SHELL = "_shell=$(command -v bash || echo /bin/sh)"
+
+
+def _run_in_shell(command: str) -> str:
+    """Run ``command`` under the guest's bash, or under ``sh`` without one."""
+    return f'{_SELECT_SHELL}; exec "$_shell" -c {shlex.quote(command)}'
+
+
 def _run_as_user(command: str, user: str | int) -> str:
     """Wrap ``command`` so ``su`` runs it as ``user`` from the same directory."""
     if isinstance(user, int) or str(user).isdigit():
         user_arg = f'"$(getent passwd {int(user)} | cut -d: -f1)"'
     else:
         user_arg = shlex.quote(str(user))
-    return f"su {user_arg} -s /bin/sh -c {shlex.quote(command)}"
+    return f'{_SELECT_SHELL}; exec su {user_arg} -s "$_shell" -c {shlex.quote(command)}'
 
 
 def _is_root(user: str | int | None) -> bool:
@@ -1003,7 +1013,7 @@ class UnikraftEnvironment(BaseEnvironment):
         if user is None:
             user = self._dockerfile_user
         if _is_root(user):
-            return command
+            return _run_in_shell(command)
         assert user is not None
         return _run_as_user(command, user)
 
