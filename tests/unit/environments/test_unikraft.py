@@ -34,6 +34,7 @@ from harbor.environments.unikraft import (
     _image_repository,
     _run_as_user,
     _run_in_shell,
+    _sanitize_name,
     _ShieldApi,
     parse_dockerfile_env,
     parse_dockerfile_user,
@@ -1467,6 +1468,17 @@ def test_parse_dockerfile_user_takes_the_last_stage(tmp_path: Path) -> None:
     dockerfile.write_text("FROM a\nUSER build\nFROM b\n")
     assert parse_dockerfile_user(dockerfile) is None
     assert parse_dockerfile_user(tmp_path / "missing") is None
+
+
+def test_sanitize_name_gives_a_valid_platform_name() -> None:
+    # The platform rejects a name with two hyphens in sequence, a trailing
+    # hyphen, or 64 characters or more.
+    assert _sanitize_name("task-demo-_vohe2__BRDNdXW") == "task-demo-vohe2-brdndxw"
+    assert _sanitize_name("Task__Demo") == "task-demo"
+    assert _sanitize_name("--task--demo--") == "task-demo"
+    assert _sanitize_name("_" * 5) == "harbor"
+    long_name = _sanitize_name("task-" + "a" * 80)
+    assert len(long_name) == 40 and not long_name.endswith("-")
 
 
 def test_run_as_user_quotes_the_command() -> None:

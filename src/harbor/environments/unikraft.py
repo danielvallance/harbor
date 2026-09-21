@@ -125,7 +125,10 @@ _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]
 
 def _sanitize_name(name: str) -> str:
     """Return a lower-case DNS-label prefix for an instance name."""
-    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+    name = re.sub(r"[^a-z0-9-]+", "-", name.lower())
+    # The platform refuses two hyphens in sequence, which a `_` that follows
+    # a `-` in the source name makes.
+    name = re.sub(r"-{2,}", "-", name).strip("-")
     return name[:_NAME_BASE_LEN].rstrip("-") or "harbor"
 
 
