@@ -82,6 +82,11 @@ _TRANSFER_DIR = PurePosixPath("/tmp")
 #: How long an interrupted command may take to exit before it is given up on.
 _INTERRUPT_GRACE_SEC = 5.0
 _SHIELD_REQUEST_TIMEOUT_SEC = 30.0
+#: The shield answers at most 1000 log entries per request and keeps 10000.
+_SHIELD_LOG_PAGE_SIZE = 1000
+_SHIELD_LOG_MAX_ENTRIES = 10_000
+#: Where the shield's log lands in the trial directory.
+SHIELD_LOG_NAME = "shield/logs.json"
 _READY_FIRST_INTERVAL_SEC = 0.25
 _READY_MAX_INTERVAL_SEC = 2.0
 _BUILD_LOG_TAIL_BYTES = 16 * 1024
@@ -320,12 +325,18 @@ class _ShieldApi:
             self._headers["authorization"] = f"Bearer {config.token}"
 
     async def _request(
-        self, method: str, path: str, *, json: Any | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> httpx.Response:
         response = await self._http.request(
             method,
             f"{self._base_url}{path}",
             json=json,
+            params=params,
             headers=self._headers,
             timeout=_SHIELD_REQUEST_TIMEOUT_SEC,
         )
@@ -361,6 +372,29 @@ class _ShieldApi:
     async def replace_policies(self, policies: list[dict[str, Any]]) -> None:
         """Install ``policies`` as the shield's whole policy set."""
         await self._request("PUT", "/policies", json=policies)
+
+    async def logs(self) -> list[dict[str, Any]]:
+        """Every entry the shield still holds, oldest first.
+
+        The endpoint answers newest first and one page at a time, so the pages
+        are gathered and then reversed.
+        """
+        entries: list[dict[str, Any]] = []
+        while len(entries) < _SHIELD_LOG_MAX_ENTRIES:
+            response = await self._request(
+                "GET",
+                "/logs",
+                params={"limit": _SHIELD_LOG_PAGE_SIZE, "offset": len(entries)},
+            )
+            body = response.json()
+            page = body.get("entries") or []
+            entries.extend(page)
+            if len(page) < _SHIELD_LOG_PAGE_SIZE or len(entries) >= body.get(
+                "total", 0
+            ):
+                break
+        entries.reverse()
+        return entries
 
 
 class UnikraftEnvironment(BaseEnvironment):
@@ -968,11 +1002,30 @@ class UnikraftEnvironment(BaseEnvironment):
             verb = "deleting" if delete else "stopping"
             self.logger.error(f"Error {verb} {label} {instance_uuid}: {exc}")
 
+    async def _save_shield_logs(self) -> None:
+        """Write the shield's log to the trial directory.
+
+        The control API is reachable from the host only, so the guest cannot
+        collect this itself. A failure here must not fail the trial.
+        """
+        if self._shield_api is None:
+            return
+        try:
+            entries = await self._shield_api.logs()
+        except Exception as exc:
+            self.logger.warning(f"Could not read the network shield log: {exc}")
+            return
+        path = self.trial_paths.trial_dir / SHIELD_LOG_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entries, indent=2))
+        self.logger.debug(f"Wrote {len(entries)} network shield log entries.")
+
     @override
     async def stop(self, delete: bool) -> None:
         """Stops the environment and optionally deletes it."""
         if self._ukc is None:
             return
+        await self._save_shield_logs()
         try:
             if self._instance_uuid is not None:
                 if not delete:
