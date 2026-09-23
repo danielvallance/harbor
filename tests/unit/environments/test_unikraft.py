@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import io
 import json
 import logging
@@ -10,7 +9,7 @@ import shlex
 import shutil
 import subprocess
 import tarfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
@@ -21,7 +20,7 @@ import pytest
 
 pytest.importorskip("unikraft_cloud")
 
-from unikraft_cloud import UnikraftCloudError
+from unikraft_cloud import Instance, InstanceStoppedError, UnikraftCloudError
 from unikraft_cloud.core.http import ApiClientConfig
 from unikraft_cloud.plugins.sandbox import ExecResult as SandboxExecResult
 from unikraft_cloud.plugins.sandbox import ExecTimeoutError, OutputChunk
@@ -31,7 +30,6 @@ from harbor.environments.factory import _ENVIRONMENT_REGISTRY
 from harbor.environments.tar_transfer import pack_dir_to_bytes
 from harbor.environments.unikraft import (
     UnikraftEnvironment,
-    _image_repository,
     _run_as_user,
     _run_in_shell,
     _sanitize_name,
@@ -62,24 +60,12 @@ class FakeCommand:
         self.uuid = uuid
         self.exit_code, self.stdout, self.stderr = answer
         self.chunks = chunks
-        self.signals: list[int | str] = []
         self.deleted = False
-
-    async def stream(self) -> AsyncIterator[OutputChunk]:
-        for chunk in self.chunks:
-            yield chunk
-
-    async def get(self) -> SimpleNamespace:
-        return SimpleNamespace(exitcode=self.exit_code)
-
-    async def signal(self, signal: int | str) -> None:
-        self.signals.append(signal)
-
-    async def delete(self) -> None:
-        self.deleted = True
 
 
 class FakeFiles:
+    """The sandbox filesystem client: whole files, with the SDK's chunking behind it."""
+
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.dirs: set[str] = set()
@@ -89,27 +75,48 @@ class FakeFiles:
     def _bytes(data: bytes | str) -> bytes:
         return data.encode() if isinstance(data, str) else data
 
-    async def upload(
-        self, path: str, filename: str, data: bytes | str, *, parents: bool = False
-    ) -> None:
-        # The plugin writes to the given path itself unless it is a directory,
-        # in which case the file lands under it.
-        base = path.rstrip("/") or "/"
-        if parents:
-            self.dirs.update(str(item) for item in PurePosixPath(base).parents)
-        target = f"{base}/{filename}" if base in self.dirs else base
-        self.files[target] = self._bytes(data)
-        self.calls.append(("upload", path, filename, len(data), parents))
+    def _make_parents(self, path: str) -> None:
+        self.dirs.update(str(item) for item in PurePosixPath(path).parents)
 
     async def write(
-        self, path: str, data: bytes | str, *, append: bool = False
+        self,
+        path: str,
+        data: bytes | str,
+        *,
+        append: bool = False,
+        parents: bool = False,
+        chunk_size: int | None = None,
     ) -> None:
+        if parents:
+            self._make_parents(path)
         previous = self.files.get(path, b"") if append else b""
         self.files[path] = previous + self._bytes(data)
         self.calls.append(("write", path, len(data), append))
 
+    async def upload_file(
+        self,
+        local: Path | str,
+        path: str,
+        *,
+        parents: bool = False,
+        chunk_size: int | None = None,
+    ) -> str:
+        if parents:
+            self._make_parents(path)
+        self.files[path] = Path(local).read_bytes()
+        self.calls.append(("upload_file", str(local), path, parents))
+        return path
+
     async def read(self, path: str) -> bytes:
         return self.files[path]
+
+    async def read_to(
+        self, path: str, local: Path | str, *, chunk_size: int | None = None
+    ) -> int:
+        data = self.files[path]
+        Path(local).write_bytes(data)
+        self.calls.append(("read_to", path, str(local)))
+        return len(data)
 
 
 class FakeSandbox:
@@ -137,7 +144,13 @@ class FakeSandbox:
         uuid = f"cmd-{len(self.commands) + 1}"
         answer = self._answer(cmd)
         if self.stream_chunks is not None:
+            # The result carries everything the sink was handed, as the SDK's does.
             chunks = list(self.stream_chunks)
+            answer = (
+                answer[0],
+                b"".join(c.data for c in chunks if c.stream == "stdout"),
+                b"".join(c.data for c in chunks if c.stream == "stderr"),
+            )
         else:
             chunks = [OutputChunk("stdout", answer[1])] if answer[1] else []
             chunks += [OutputChunk("stderr", answer[2])] if answer[2] else []
@@ -155,11 +168,25 @@ class FakeSandbox:
         stdin: bytes | str | None = None,
         timeout: float | None = None,
         wait_delay: float | None = None,
+        on_output: Callable[[OutputChunk], Any] | None = None,
+        forget: bool = False,
     ) -> SandboxExecResult:
         command = await self.run(cmd, cwd=cwd, env=env)
-        self.execs[-1].update(timeout=timeout, wait_delay=wait_delay)
+        self.execs[-1].update(
+            timeout=timeout,
+            wait_delay=wait_delay,
+            streamed=on_output is not None,
+            forget=forget,
+        )
+        if on_output is not None:
+            for chunk in command.chunks:
+                handed = on_output(chunk)
+                if handed is not None:
+                    await handed
         if self.raise_timeout:
             raise ExecTimeoutError(command)  # type: ignore[arg-type]
+        if forget:
+            command.deleted = True
         return SandboxExecResult(
             uuid=command.uuid,
             exit_code=command.exit_code,
@@ -167,9 +194,6 @@ class FakeSandbox:
             stderr=command.stderr,
             interrupted=self.interrupted,
         )
-
-    def command(self, uuid: str) -> FakeCommand:
-        return self.commands[uuid]
 
 
 class FakePlugin:
@@ -197,11 +221,11 @@ class FakeHandle:
     def plugin(self, name: str) -> FakePlugin:
         return FakePlugin(self._client, self.uuid, name)
 
-    async def delete(self) -> None:
+    async def delete(self, **opts: Any) -> None:
         self._client.events.append(("delete", self.uuid))
-        if self._client.fail_delete_once:
-            self._client.fail_delete_once = False
-            raise UnikraftCloudError("instance is running", kind="network")
+        self._client.delete_opts.append(opts)
+        if self._client.fail_delete:
+            raise UnikraftCloudError("Unknown error -16", kind="http")
 
     async def stop(self) -> None:
         self._client.events.append(("stop", self.uuid))
@@ -214,11 +238,8 @@ class FakeHandle:
 
     def __await__(self) -> Any:
         async def read() -> SimpleNamespace:
-            reason, code = self._client.stopped.get(self.uuid, (None, None))
             return SimpleNamespace(
                 uuid=self.uuid,
-                stop_reason=reason,
-                stop_code=code,
                 # The platform names the interface it gives an instance.
                 network_interfaces=[SimpleNamespace(uuid=f"iface-{self.uuid}")],
             )
@@ -234,12 +255,22 @@ class FakeInstances:
         self._client.created.append(spec)
         if self._client.create_failures > 0:
             self._client.create_failures -= 1
-            uuid = f"stopped-{len(self._client.created)}"
-            self._client.stopped[uuid] = self._client.stop_detail
-            raise UnikraftCloudError(
-                "Unikraft Cloud API reported an error",
-                kind="api",
-                errors=(SimpleNamespace(uuid=uuid),),
+            reason, code = self._client.stop_detail
+            stopped = Instance.model_validate(
+                {
+                    "uuid": f"stopped-{len(self._client.created)}",
+                    "name": spec.get("name"),
+                    "state": "stopped",
+                    "stop_reason": reason,
+                    "stop_code": code,
+                    "metro": "test",
+                }
+            )
+            detail = stopped.describe_stop()
+            raise InstanceStoppedError(
+                f'instance name "{spec.get("name")}" stopped before it was running'
+                + (f": {detail}" if detail else ""),
+                instance=stopped,
             )
         uuid = f"inst-{len(self._client.created)}"
         return SimpleNamespace(uuid=uuid, name=spec.get("name"), state="running")
@@ -248,45 +279,22 @@ class FakeInstances:
         return FakeHandle(self._client, uuid or f"name:{name}")
 
 
-#: The credentials a UKC token encodes, as the registry wants them.
-REGISTRY_USER = "demo"
-REGISTRY_TOKEN = base64.b64encode(b"demo:secret").decode()
-
-
-class FakeRegistry:
-    """The OCI registry: a token endpoint, and a manifest per image it holds."""
+class FakeImages:
+    """The SDK's registry lookup: the tags the registry holds, and each ask."""
 
     def __init__(self) -> None:
-        self.tags: set[str] = set()
-        self.manifest_calls = 0
-        self.token_calls = 0
-        self.scopes: list[str] = []
-        self.status: int | None = None
+        self.known: set[str] = set()
+        self.checked: list[str] = []
+        self.failing = False
 
     def add(self, image_ref: str) -> None:
-        self.tags.add(image_ref)
+        self.known.add(image_ref)
 
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/service/token":
-            self.token_calls += 1
-            self.scopes.append(request.url.params.get("scope", ""))
-            return httpx.Response(200, json={"token": "registry-token"})
-        self.manifest_calls += 1
-        if self.status is not None:
-            return httpx.Response(self.status)
-        if request.headers.get("authorization") != "Bearer registry-token":
-            return httpx.Response(
-                401,
-                headers={
-                    "www-authenticate": (
-                        'Bearer realm="https://unikraft.io/service/token",'
-                        'service="harbor-registry"'
-                    )
-                },
-            )
-        repository, _, tag = request.url.path.partition("/manifests/")
-        reference = f"{repository.removeprefix('/v2/')}:{tag}"
-        return httpx.Response(200 if reference in self.tags else 404)
+    async def exists(self, image_ref: str) -> bool:
+        self.checked.append(image_ref)
+        if self.failing:
+            raise UnikraftCloudError("control plane unavailable", kind="network")
+        return image_ref in self.known
 
 
 class FakeClient:
@@ -295,13 +303,13 @@ class FakeClient:
     def __init__(self) -> None:
         self.kwargs: dict[str, Any] = {}
         self.instances = FakeInstances(self)
-        self.registry = FakeRegistry()
+        self.images = FakeImages()
         self.sandbox = FakeSandbox()
         self.created: list[dict[str, Any]] = []
         self.events: list[tuple[str, str]] = []
-        self.fail_delete_once = False
+        self.delete_opts: list[dict[str, Any]] = []
+        self.fail_delete = False
         self.create_failures = 0
-        self.stopped: dict[str, tuple[int | None, int | None]] = {}
         #: What the platform reports for an instance a failed create left behind.
         self.stop_detail: tuple[int | None, int | None] = (None, None)
         self.closed = False
@@ -340,16 +348,7 @@ def fake_ukc(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
     monkeypatch.setattr(unikraft_module, "UnikraftCloud", factory)
     for variable in ("UKC_METRO", "UKC_USER"):
         monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setenv("UKC_TOKEN", REGISTRY_TOKEN)
-
-    real_client = httpx.AsyncClient
-
-    def http_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        # A caller with its own transport, such as the shield, keeps it.
-        kwargs.setdefault("transport", httpx.MockTransport(client.registry.handle))
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr(unikraft_module.httpx, "AsyncClient", http_factory)
+    monkeypatch.setenv("UKC_TOKEN", "tok")
     monkeypatch.setattr(unikraft_module, "_READY_FIRST_INTERVAL_SEC", 0.001)
     monkeypatch.setattr(unikraft_module, "_READY_MAX_INTERVAL_SEC", 0.001)
     return client
@@ -525,14 +524,13 @@ async def test_start_builds_only_a_missing_image(
 ) -> None:
     env = _make_env(temp_dir, dockerfile_contents="FROM alpine:3.20\n")
     ref = env._image_ref()
-    fake_ukc.registry.add(ref)
+    fake_ukc.images.add(ref)
     # Another task's image, and the same task at another revision, are not it.
-    fake_ukc.registry.add("demo/harbor-other:7140400b7907")
-    fake_ukc.registry.add(f"{ref.rsplit(':', 1)[0]}:0000deadbeef")
+    fake_ukc.images.add("demo/harbor-other:7140400b7907")
+    fake_ukc.images.add(f"{ref.rsplit(':', 1)[0]}:0000deadbeef")
 
     await env.start(force_build=False)
-    assert fake_ukc.registry.manifest_calls == 2  # the challenge, then the answer
-    assert fake_ukc.registry.scopes == [f"repository:{_image_repository(ref)}:pull"]
+    assert fake_ukc.images.checked == [ref]
     assert fake_build == []
 
     await env.start(force_build=True)
@@ -546,7 +544,7 @@ async def test_start_builds_when_the_image_is_absent_or_unknown(
     await env.start(force_build=False)
     assert [ref for _, ref in fake_build] == [env._image_ref()]
 
-    fake_ukc.registry.status = 500
+    fake_ukc.images.failing = True
     await env.start(force_build=False)
     assert len(fake_build) == 2
 
@@ -555,7 +553,7 @@ async def test_require_prebuilt_image_starts_from_an_existing_image(
     fake_ukc: FakeClient, fake_build: list[tuple[str, str]], temp_dir: Path
 ) -> None:
     env = _make_env(temp_dir, require_prebuilt_image=True)
-    fake_ukc.registry.add(env._image_ref())
+    fake_ukc.images.add(env._image_ref())
 
     await env.start(force_build=False)
     assert fake_build == []
@@ -577,7 +575,7 @@ async def test_require_prebuilt_image_rejects_force_build(
     fake_ukc: FakeClient, fake_build: list[tuple[str, str]], temp_dir: Path
 ) -> None:
     env = _make_env(temp_dir, require_prebuilt_image=True)
-    fake_ukc.registry.add(env._image_ref())
+    fake_ukc.images.add(env._image_ref())
 
     with pytest.raises(ValueError, match="force_build"):
         await env.start(force_build=True)
@@ -1126,59 +1124,39 @@ async def test_exec_streams_output_to_the_callback(
     assert sandbox.commands["cmd-1"].deleted is True
 
 
-async def test_streamed_exec_timeout_interrupts_the_command(
-    fake_ukc: FakeClient,
-    fake_build: list[tuple[str, str]],
-    temp_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
+async def test_streamed_exec_timeout_raises_like_docker(
+    fake_ukc: FakeClient, fake_build: list[tuple[str, str]], temp_dir: Path
 ) -> None:
     env, sandbox = await _started(fake_ukc, temp_dir)
-
-    async def stall(self: FakeCommand) -> AsyncIterator[OutputChunk]:
-        import asyncio
-
-        await asyncio.sleep(60)
-        yield OutputChunk("stdout", b"")
-
-    monkeypatch.setattr(FakeCommand, "stream", stall)
 
     async def callback(text: str, stream: str) -> None:
         pass
 
+    # The SDK interrupts the command and waits out the same grace as without
+    # a callback; harbor only has to report the timeout the way docker does.
+    sandbox.raise_timeout = True
     with env.scoped_output_callback(callback):
         with pytest.raises(RuntimeError, match="Command timed out after 1 seconds"):
             await env.exec("sleep 60", timeout_sec=1)
-    assert sandbox.commands["cmd-1"].signals == [2]
+    assert sandbox.execs[-1]["streamed"] is True
+    assert sandbox.execs[-1]["timeout"] == 1
+    assert sandbox.execs[-1]["wait_delay"] == 5.0
 
 
 # ---------- files ----------
 
 
-async def test_upload_file_creates_parents_and_chunks_large_files(
-    fake_ukc: FakeClient,
-    fake_build: list[tuple[str, str]],
-    temp_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
+async def test_upload_file_hands_the_local_file_to_the_sdk_with_parents(
+    fake_ukc: FakeClient, fake_build: list[tuple[str, str]], temp_dir: Path
 ) -> None:
     env, sandbox = await _started(fake_ukc, temp_dir)
-    monkeypatch.setattr(unikraft_module, "_UPLOAD_CHUNK_BYTES", 4)
 
+    # The SDK reads the file in pieces and creates the directories above it.
     small = temp_dir / "small.txt"
     small.write_bytes(b"abc")
     await env.upload_file(small, "/opt/app/small.txt")
-    assert sandbox.fs.calls == [("upload", "/opt/app/small.txt", "small.txt", 3, True)]
+    assert sandbox.fs.calls == [("upload_file", str(small), "/opt/app/small.txt", True)]
     assert sandbox.fs.files["/opt/app/small.txt"] == b"abc"
-
-    sandbox.fs.calls.clear()
-    large = temp_dir / "large.bin"
-    large.write_bytes(b"0123456789")
-    await env.upload_file(str(large), "/data/large.bin")
-    assert sandbox.fs.calls == [
-        ("upload", "/data/large.bin", "large.bin", 4, True),
-        ("write", "/data/large.bin", 4, True),
-        ("write", "/data/large.bin", 2, True),
-    ]
-    assert sandbox.fs.files["/data/large.bin"] == b"0123456789"
 
 
 def _dockerfile(temp_dir: Path, name: str, contents: str) -> Path:
@@ -1387,6 +1365,9 @@ async def test_stop_deletes_instance_and_shield_and_closes_the_client(
     await env.start(force_build=False)
     await env.stop(delete=True)
     assert fake_ukc.events == [("delete", "inst-2"), ("delete", "inst-1")]
+    # The platform stops a running instance itself; the shield's interface stays
+    # busy for a while after the task instance is gone, so both deletes retry.
+    assert fake_ukc.delete_opts == [{"retry_busy": 20.0, "missing_ok": True}] * 2
     assert fake_ukc.closed is True
     assert env.get_sandbox_id() is None
     with pytest.raises(RuntimeError, match="start the environment"):
@@ -1404,18 +1385,21 @@ async def test_stop_without_delete_stops_both_instances(
     assert env.get_sandbox_id() == "inst-2"
 
 
-async def test_stop_falls_back_to_stopping_before_deleting(
-    fake_ukc: FakeClient, fake_build: list[tuple[str, str]], temp_dir: Path
+async def test_a_failed_delete_is_logged_and_the_stop_completes(
+    fake_ukc: FakeClient,
+    fake_build: list[tuple[str, str]],
+    temp_dir: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    env = _make_env(temp_dir)
+    logger = logging.getLogger("test-unikraft")
+    env = _make_env(temp_dir, logger=logger)
     await env.start(force_build=False)
-    fake_ukc.fail_delete_once = True
-    await env.stop(delete=True)
-    assert fake_ukc.events == [
-        ("delete", "inst-1"),
-        ("stop", "inst-1"),
-        ("delete", "inst-1"),
-    ]
+    fake_ukc.fail_delete = True
+    with caplog.at_level(logging.ERROR, logger="test-unikraft"):
+        await env.stop(delete=True)
+    assert fake_ukc.events == [("delete", "inst-1")]
+    assert "Error deleting instance inst-1" in caplog.text
+    assert fake_ukc.closed is True
 
 
 async def test_stop_before_start_is_a_noop(
@@ -1586,19 +1570,6 @@ def test_run_in_shell_falls_back_to_sh(tmp_path: Path) -> None:
     assert result.stdout.strip() == "ok"
 
 
-def test_image_repository_drops_scheme_registry_digest_and_tag() -> None:
-    # The store reports every image under the central registry, so the
-    # repository and tag are what identify one, whichever registry holds it.
-    assert (
-        _image_repository("unikraft.io/demo/harbor-hello-world@sha256:abc")
-        == "demo/harbor-hello-world"
-    )
-    assert _image_repository("oci://unikraft.io/demo/app:latest") == "demo/app"
-    assert _image_repository("index.fra0-fe-test.unikraft.cloud/demo/app") == "demo/app"
-    assert _image_repository("demo/app:tag") == "demo/app"
-    assert _image_repository("") == ""
-
-
 async def test_create_waits_out_an_image_the_nodes_cannot_pull_yet(
     fake_ukc: FakeClient,
     fake_build: list[tuple[str, str]],
@@ -1627,7 +1598,7 @@ async def test_create_is_retried_for_an_image_this_run_did_not_push(
     """A node fails to pull whatever it is asked for, not only a new image."""
     monkeypatch.setattr(unikraft_module, "_IMAGE_RETRY_INTERVAL_SEC", 0)
     env = _make_env(temp_dir)
-    fake_ukc.registry.add(env._image_ref())
+    fake_ukc.images.add(env._image_ref())
     fake_ukc.create_failures = 1
 
     await env.start(force_build=False)
@@ -1665,15 +1636,9 @@ async def test_a_failed_create_reports_why_the_platform_stopped_it(
     fake_ukc.create_failures = 99
     fake_ukc.stop_detail = (4, 1)
 
-    with pytest.raises(UnikraftCloudError, match="could not pull the image"):
+    # The SDK reads the stopped instance and decodes why the platform gave up.
+    with pytest.raises(InstanceStoppedError, match="image pull failed"):
         await env.start(force_build=False)
-
-
-def test_kernel_stop_codes_are_decoded() -> None:
-    # 0xC0004: page fault with errno 12, which is how a too-small memory_mb reads.
-    assert "ran out of memory" in unikraft_module._kernel_stop_detail(0xC0004)
-    assert "segmentation fault" in unikraft_module._kernel_stop_detail(5)
-    assert "code 255" in unikraft_module._kernel_stop_detail(255)
 
 
 async def test_a_failed_create_reports_an_out_of_memory_kernel_stop(
@@ -1688,7 +1653,7 @@ async def test_a_failed_create_reports_an_out_of_memory_kernel_stop(
     fake_ukc.create_failures = 99
     fake_ukc.stop_detail = (1, 0xC0004)
 
-    with pytest.raises(UnikraftCloudError, match="ran out of memory"):
+    with pytest.raises(InstanceStoppedError, match="out of memory"):
         await env.start(force_build=False)
 
 

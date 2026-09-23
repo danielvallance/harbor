@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import codecs
 import contextlib
 import json
@@ -75,9 +74,6 @@ DEFAULT_ARCH = "x86_64"
 DEFAULT_KEEPALIVE: tuple[str, ...] = ("/bin/sh", "-c", "sleep infinity")
 UNIKRAFT_CLI_ENV = "HARBOR_UNIKRAFT_CLI"
 
-#: Base64 in one request must stay under the plugin's 2 MB body limit, so
-#: large files travel in appended pieces.
-_UPLOAD_CHUNK_BYTES = 1024 * 1024
 _TRANSFER_DIR = PurePosixPath("/tmp")
 #: How long an interrupted command may take to exit before it is given up on.
 _INTERRUPT_GRACE_SEC = 5.0
@@ -93,33 +89,9 @@ _BUILD_LOG_TAIL_BYTES = 16 * 1024
 #: How often to retry a create whose image the nodes cannot pull yet.
 _IMAGE_RETRY_INTERVAL_SEC = 5.0
 _IMAGE_RETRY_ATTEMPTS = 6
-#: The registry that holds task images when no other one is pinned.
-DEFAULT_REGISTRY = "unikraft.io"
-#: The manifest types a registry may answer an existence check with.
-_MANIFEST_TYPES = (
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-)
-_REGISTRY_TIMEOUT_SEC = 30.0
-#: The stop of an instance that the platform alone brought down.
-_STOP_REASON_PLATFORM = 4
-#: The stop of an instance whose kernel exited.
-_STOP_REASON_KERNEL = 1
-#: The platform stop code for an image a node could not pull.
-_STOP_CODE_IMAGE_PULL_FAILED = 1
-#: A kernel stop code packs the reason in its low byte and an errno above it.
-_KERNEL_STOP_REASONS = {
-    1: "an assertion failed",
-    2: "an arithmetic error",
-    3: "an instruction error",
-    4: "a page fault",
-    5: "a segmentation fault",
-    6: "a hardware error",
-    7: "a security violation",
-}
-_ENOMEM = 12
+#: How long a delete keeps retrying while the platform reports the instance
+#: busy: a relay interface stays in use for a while after its user is gone.
+_DELETE_BUSY_RETRY_SEC = 20.0
 #: The longest the create call may block for the instance to run.
 _CREATE_WAIT_MAX_SEC = 60
 #: Instance and interface names must stay DNS-label sized.
@@ -141,52 +113,6 @@ def _sanitize_image_name(name: str) -> str:
     """Return a registry path segment for an image name."""
     name = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-.")
     return name or "harbor"
-
-
-def _image_repository(url: str) -> str:
-    """The ``<namespace>/<name>`` of an image URL, without scheme, registry or digest.
-
-    The image store reports every image under the central registry, whichever
-    one holds it, so the repository and tag are what identify one there.
-    """
-    reference = url.split("://", 1)[-1].split("@", 1)[0]
-    head, _, name = reference.rpartition("/")
-    reference = f"{head}/{name.split(':', 1)[0]}" if head else name.split(":", 1)[0]
-    # A registry host carries a dot or a port, unlike a namespace.
-    host, _, rest = reference.partition("/")
-    return rest if rest and ("." in host or ":" in host) else reference
-
-
-def _auth_challenge(header: str) -> dict[str, str]:
-    """The parameters of a registry's ``Bearer`` authentication challenge."""
-    scheme, _, rest = header.partition(" ")
-    if scheme.lower() != "bearer":
-        return {}
-    return dict(re.findall(r'([a-z_]+)="([^"]*)"', rest))
-
-
-def _registry_credentials(token: str | None) -> tuple[str, str] | None:
-    """The user and password the registry wants, which a UKC token encodes."""
-    if not token:
-        return None
-    try:
-        decoded = base64.b64decode(token, validate=True).decode()
-    except (ValueError, UnicodeDecodeError):
-        return None
-    user, separator, password = decoded.partition(":")
-    return (user, password) if separator and user else None
-
-
-def _kernel_stop_detail(stop_code: int) -> str:
-    """Why a kernel stopped, from the reason and errno its stop code packs."""
-    reason = stop_code & 0xFF
-    errno = (stop_code >> 16) & 0xFF
-    if reason == 4 and errno == _ENOMEM:
-        return "the instance ran out of memory; its image may not fit in memory_mb"
-    described = _KERNEL_STOP_REASONS.get(reason)
-    if described is None:
-        return f"the kernel exited, code {stop_code}"
-    return f"the kernel exited on {described}" + (f" (errno {errno})" if errno else "")
 
 
 #: Shell selection the guest evaluates before it runs a command. Harbor
@@ -694,56 +620,21 @@ class UnikraftEnvironment(BaseEnvironment):
             }
         ]
 
-    async def _registry_token(
-        self, client: httpx.AsyncClient, challenge: dict[str, str], repository: str
-    ) -> str | None:
-        """Trade the UKC credentials for a registry token, as the challenge asks."""
-        realm = challenge.get("realm")
-        credentials = _registry_credentials(os.environ.get("UKC_TOKEN"))
-        if not realm or credentials is None:
-            return None
-        params = {"scope": f"repository:{repository}:pull"}
-        if challenge.get("service"):
-            params["service"] = challenge["service"]
-        response = await client.get(realm, params=params, auth=credentials)
-        response.raise_for_status()
-        body = response.json()
-        token = body.get("token") or body.get("access_token")
-        return token if isinstance(token, str) else None
-
     async def _image_exists(self, image_ref: str) -> bool:
         """Whether the registry holds this exact image.
 
         The tag is the hash of the environment's contents, so a match is the
-        same build inputs. The registry answers what a node can pull. The image
-        store does not: it reports the nodes' cache, which drops images the
-        registry keeps and keeps images the registry has dropped.
+        same build inputs. The SDK asks the control plane, which answers from
+        the registry itself: what a node can pull, rather than what the
+        metros' nodes happen to have cached.
         """
-        repository = _image_repository(image_ref)
-        tag = image_ref.rpartition(":")[2]
-        registry = self._registry or DEFAULT_REGISTRY
-        url = f"https://{registry}/v2/{repository}/manifests/{tag}"
-        headers: dict[str, str] = {"accept": ", ".join(_MANIFEST_TYPES)}
         try:
-            async with httpx.AsyncClient(
-                timeout=_REGISTRY_TIMEOUT_SEC, follow_redirects=True
-            ) as client:
-                response = await client.head(url, headers=headers)
-                if response.status_code == httpx.codes.UNAUTHORIZED:
-                    challenge = _auth_challenge(
-                        response.headers.get("www-authenticate", "")
-                    )
-                    token = await self._registry_token(client, challenge, repository)
-                    if token is None:
-                        raise RuntimeError("the registry issued no token")
-                    headers["authorization"] = f"Bearer {token}"
-                    response = await client.head(url, headers=headers)
+            return await self._client().images.exists(image_ref)
         except Exception as exc:
             self.logger.warning(
                 f"Could not check for image {image_ref}, building it: {exc}"
             )
             return False
-        return response.status_code == httpx.codes.OK
 
     def _assert_prebuilt(self, image_ref: str, force_build: bool) -> None:
         """Refuse a build request when the caller requires a prebuilt image."""
@@ -823,64 +714,27 @@ class UnikraftEnvironment(BaseEnvironment):
     async def _discard_instance(self, name: str) -> None:
         """Delete the instance a failed create left behind, if it made one."""
         with contextlib.suppress(Exception):
-            await self._client().instances.get(name=name).delete()
-
-    async def _stop_detail(self, exc: UnikraftCloudError) -> str | None:
-        """Why the platform stopped the instance a failed create left behind.
-
-        The create answers with an item the platform marks failed and leaves
-        without a message, so the reason is read off the instance itself.
-        """
-        uuid = next((error.uuid for error in (exc.errors or []) if error.uuid), None)
-        if uuid is None:
-            return None
-        try:
-            instance = await self._client().instances.get(uuid=uuid)
-        except Exception:
-            return None
-        reason, code = instance.stop_reason, instance.stop_code
-        if reason == _STOP_REASON_PLATFORM:
-            if code == _STOP_CODE_IMAGE_PULL_FAILED:
-                return "the node could not pull the image"
-            return f"platform stop, code {code}"
-        if reason == _STOP_REASON_KERNEL and code is not None:
-            return _kernel_stop_detail(code)
-        return None if reason is None else f"stop reason {reason}"
-
-    @staticmethod
-    def _create_error(
-        exc: UnikraftCloudError, name: str, detail: str | None
-    ) -> UnikraftCloudError:
-        """The create failure, carrying the platform's own reason for it."""
-        if detail is None:
-            return exc
-        return UnikraftCloudError(
-            f"Could not create {name}: {detail}",
-            kind=exc.kind,
-            status=exc.status,
-            errors=exc.errors,
-            body=exc.body,
-        )
+            await self._client().instances.get(name=name).delete(missing_ok=True)
 
     async def _create_instance(self, spec: dict[str, Any], *, attempts: int) -> Any:
         """Create the instance, waiting out a node that cannot pull the image.
 
         For a few seconds after any push the nodes fail to pull, so a create in
-        that window stops at once and still leaves a stopped instance. Every
-        failed attempt is read for its reason, then discarded.
+        that window stops at once and still leaves a stopped instance. The SDK
+        reads that instance and reports why it stopped; every failed attempt
+        is discarded, then tried again.
         """
         name = spec["name"]
         for attempt in range(1, attempts + 1):
             try:
                 return await self._client().instances.create(**spec)
             except UnikraftCloudError as exc:
-                detail = await self._stop_detail(exc)
                 await self._discard_instance(name)
                 if attempt == attempts:
-                    raise self._create_error(exc, name, detail) from exc
+                    raise
                 self.logger.debug(
                     f"Create attempt {attempt} failed for {name}, retrying in "
-                    f"{_IMAGE_RETRY_INTERVAL_SEC}s: {detail or exc}"
+                    f"{_IMAGE_RETRY_INTERVAL_SEC}s: {exc}"
                 )
                 await asyncio.sleep(_IMAGE_RETRY_INTERVAL_SEC)
         raise RuntimeError("unreachable")
@@ -988,17 +842,18 @@ class UnikraftEnvironment(BaseEnvironment):
     async def _remove_instance(
         self, instance_uuid: str, *, delete: bool, label: str
     ) -> None:
+        """Stop or delete an instance, logging a failure rather than raising it.
+
+        The platform stops a running instance as part of deleting it. The
+        shield's relay interface stays busy for a while after the task instance
+        that used it is gone, so a delete keeps retrying for that long.
+        """
         handle = self._client().instances.get(uuid=instance_uuid)
         try:
-            if not delete:
+            if delete:
+                await handle.delete(retry_busy=_DELETE_BUSY_RETRY_SEC, missing_ok=True)
+            else:
                 await handle.stop()
-                return
-            try:
-                await handle.delete()
-            except UnikraftCloudError:
-                # A running instance may need to stop before it can go.
-                await handle.stop()
-                await handle.delete()
         except Exception as exc:
             verb = "deleting" if delete else "stopping"
             self.logger.error(f"Error {verb} {label} {instance_uuid}: {exc}")
@@ -1101,10 +956,17 @@ class UnikraftEnvironment(BaseEnvironment):
             cwd, self.task_env_config.workdir, self._dockerfile_workdir
         )
         callback = self._output_callback()
-        if callback is not None:
-            return await self._exec_streaming(
-                sandbox, full_command, exec_cwd, exec_env, timeout_sec, callback
-            )
+        # The callback takes text, so each stream is decoded a piece at a time
+        # and a character split across two pieces still comes out whole.
+        decoders = {
+            stream: codecs.getincrementaldecoder("utf-8")(errors="replace")
+            for stream in ("stdout", "stderr")
+        }
+
+        async def relay(chunk: OutputChunk) -> None:
+            text = decoders[chunk.stream].decode(chunk.data)
+            if text:
+                await callback(text, chunk.stream)
 
         try:
             result = await sandbox.exec(
@@ -1113,12 +975,18 @@ class UnikraftEnvironment(BaseEnvironment):
                 env=exec_env,
                 timeout=timeout_sec,
                 wait_delay=None if timeout_sec is None else _INTERRUPT_GRACE_SEC,
+                on_output=None if callback is None else relay,
+                forget=True,
             )
         except ExecTimeoutError as exc:
             raise RuntimeError(
                 f"Command timed out after {timeout_sec} seconds"
             ) from exc
-        await self._forget_command(sandbox, result.uuid)
+        if callback is not None:
+            for stream, decoder in decoders.items():
+                text = decoder.decode(b"", final=True)
+                if text:
+                    await callback(text, stream)  # type: ignore[arg-type]
         if result.interrupted:
             raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
         return ExecResult(
@@ -1127,78 +995,9 @@ class UnikraftEnvironment(BaseEnvironment):
             return_code=result.exit_code,
         )
 
-    async def _exec_streaming(
-        self,
-        sandbox: Sandbox,
-        command: str,
-        cwd: str | None,
-        env: dict[str, str],
-        timeout_sec: int | None,
-        callback: Any,
-    ) -> ExecResult:
-        """Run a command, handing each output piece to ``callback`` as it arrives."""
-        handle = await sandbox.run(command, cwd=cwd, env=env)
-        buffers = {"stdout": bytearray(), "stderr": bytearray()}
-        decoders = {
-            stream: codecs.getincrementaldecoder("utf-8")(errors="replace")
-            for stream in buffers
-        }
-
-        async def consume() -> None:
-            chunk: OutputChunk
-            async for chunk in handle.stream():
-                buffers[chunk.stream].extend(chunk.data)
-                text = decoders[chunk.stream].decode(chunk.data)
-                if text:
-                    await callback(text, chunk.stream)
-
-        try:
-            if timeout_sec is None:
-                await consume()
-            else:
-                await asyncio.wait_for(consume(), timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(handle.signal(2), _INTERRUPT_GRACE_SEC)
-            raise RuntimeError(
-                f"Command timed out after {timeout_sec} seconds"
-            ) from None
-
-        for stream, decoder in decoders.items():
-            text = decoder.decode(b"", final=True)
-            if text:
-                await callback(text, stream)  # type: ignore[arg-type]
-        info = await handle.get()
-        await self._forget_command(sandbox, handle.uuid)
-        if info.exitcode is None:
-            raise RuntimeError(f"Command {handle.uuid} ended without an exit code.")
-        return ExecResult(
-            stdout=bytes(buffers["stdout"]).decode(errors="replace"),
-            stderr=bytes(buffers["stderr"]).decode(errors="replace"),
-            return_code=info.exitcode,
-        )
-
-    async def _forget_command(self, sandbox: Sandbox, command_uuid: str) -> None:
-        """Drop a finished command so the plugin does not keep its output."""
-        with contextlib.suppress(UnikraftCloudError):
-            await sandbox.command(command_uuid).delete()
-
     # ------------------------------------------------------------------
     # Files
     # ------------------------------------------------------------------
-
-    async def _write_remote(self, target_path: str, data: bytes) -> None:
-        """Write ``data`` to ``target_path``, creating the directories above it."""
-        files = self._require_sandbox().fs
-        target = PurePosixPath(target_path)
-        first, rest = data[:_UPLOAD_CHUNK_BYTES], data[_UPLOAD_CHUNK_BYTES:]
-        # The file lands at the given path and `parents` makes the directories
-        # above it; `filename` applies only to a path that is a directory.
-        await files.upload(target_path, target.name, first, parents=True)
-        for offset in range(0, len(rest), _UPLOAD_CHUNK_BYTES):
-            await files.write(
-                target_path, rest[offset : offset + _UPLOAD_CHUNK_BYTES], append=True
-            )
 
     async def _remove_remote(self, path: str) -> None:
         await self.exec(f"rm -f {shlex.quote(path)}", user="root")
@@ -1215,7 +1014,9 @@ class UnikraftEnvironment(BaseEnvironment):
             source_path: The path to the source local file.
             target_path: The path to which to copy the file.
         """
-        await self._write_remote(target_path, Path(source_path).read_bytes())
+        await self._require_sandbox().fs.upload_file(
+            source_path, target_path, parents=True
+        )
 
     @override
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
@@ -1230,7 +1031,7 @@ class UnikraftEnvironment(BaseEnvironment):
             target_dir: The path to which to copy the directory.
         """
         archive = self._transfer_path(".tar.gz")
-        await self._write_remote(
+        await self._require_sandbox().fs.write(
             archive, pack_dir_to_bytes(source_dir, compress=True).getvalue()
         )
         try:
@@ -1253,10 +1054,9 @@ class UnikraftEnvironment(BaseEnvironment):
             source_path: The path to the source file in the environment.
             target_path: The local path to which to copy the file.
         """
-        data = await self._require_sandbox().fs.read(source_path)
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        await self._require_sandbox().fs.read_to(source_path, target)
 
     @override
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
