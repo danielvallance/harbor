@@ -595,12 +595,13 @@ class UnikraftEnvironment(BaseEnvironment):
                 "Unikraft needs a registry namespace for task images: pass the "
                 "image_namespace kwarg or set UKC_USER."
             )
-        name = _sanitize_image_name(f"harbor-{self.environment_name}")
+        # Content-addressed like the Daytona snapshot: the ref follows the
+        # environment hash, not the task name, so prebuild and worker agree.
         tag = self.environment_id[:SNAPSHOT_HASH_LEN]
         # Unqualified, so the CLI resolves it against the metro's own index and
         # falls back to the central registry. `registry` pins one instead.
         prefix = f"{self._registry}/" if self._registry else ""
-        return f"{prefix}{namespace}/{name}:{tag}"
+        return f"{prefix}{namespace}/harbor-task:{tag}"
 
     def _tags(self) -> list[str]:
         tags = ["harbor", f"harbor.session={self.session_id}"]
