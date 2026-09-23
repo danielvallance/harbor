@@ -239,3 +239,6 @@ apps/*
 .agents/
 .tensorlake/
 /configs/
+
+# Internal working notes; kept local, not shipped.
+/unikraft-sandbox-support.md
